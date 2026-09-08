@@ -337,6 +337,92 @@ SELECT * FROM drop_graph('vle_trigger_test', true);
 
 -----------------------------------------------------------------------------------------------------------------------------
 --
+-- age.max_global_graph_memory
+--
+-- The global graph cache is a full in-memory copy of a graph's adjacency,
+-- built once per backend. Before this GUC existed nothing bounded it, so a
+-- large enough graph grew the backend until the OOM killer took it down.
+-- Exceeding the limit can only be an error: every traversal consumer needs
+-- the cache, so there is no uncached path to fall back to.
+--
+-- These tests assert the observable contract only. They deliberately do not
+-- check byte counts: the amount a graph occupies depends on the allocator
+-- and on where the element count falls relative to the hashtables'
+-- power-of-two sizing.
+--
+-----------------------------------------------------------------------------------------------------------------------------
+
+SELECT * FROM create_graph('ggm');
+SELECT * FROM cypher('ggm', $$
+  CREATE (a:V {n: 'a'})-[:E]->(b:V {n: 'b'})-[:E]->(c:V {n: 'c'})
+$$) AS (v agtype);
+ANALYZE ggm."V";
+ANALYZE ggm."E";
+
+-- the default is unlimited, and is a superuser-only kB setting
+SELECT setting, unit, vartype, context
+FROM pg_settings WHERE name = 'age.max_global_graph_memory';
+
+-- unlimited: the traversal works
+SELECT * FROM cypher('ggm', $$
+  MATCH (a:V {n: 'a'})-[:E*1..2]->(x) RETURN x.n ORDER BY x.n
+$$) AS (n agtype);
+
+-- Start from an empty cache so that the limit applies to this graph alone,
+-- and report errors terse: the detail line carries sizes that depend on the
+-- allocator and on what else the backend has cached.
+SELECT ag_catalog.age_delete_global_graphs(NULL);
+\set VERBOSITY terse
+
+-- a limit no graph can satisfy: the load is refused, not the backend
+SET age.max_global_graph_memory = '1kB';
+SELECT * FROM cypher('ggm', $$
+  MATCH (a:V {n: 'a'})-[:E*1..2]->(x) RETURN x.n ORDER BY x.n
+$$) AS (n agtype);
+
+-- the error is reported as a configuration limit, so an application can
+-- recognize it by SQLSTATE rather than by message text
+DO $$
+BEGIN
+    PERFORM * FROM cypher('ggm', $q$
+      MATCH (a:V {n: 'a'})-[:E*1..2]->(x) RETURN x.n
+    $q$) AS (n agtype);
+    RAISE NOTICE 'no error raised';
+EXCEPTION WHEN configuration_limit_exceeded THEN
+    RAISE NOTICE 'configuration_limit_exceeded';
+END
+$$;
+
+-- a refused load leaves nothing cached: raising the limit in the same
+-- session must produce a complete graph, not a partially loaded one
+RESET age.max_global_graph_memory;
+SELECT * FROM cypher('ggm', $$
+  MATCH (a:V {n: 'a'})-[:E*1..2]->(x) RETURN x.n ORDER BY x.n
+$$) AS (n agtype);
+
+-- the limit is a per-backend total across every cached graph, so a second
+-- graph is refused once the first has consumed the budget
+SELECT * FROM create_graph('ggm2');
+SELECT * FROM cypher('ggm2', $$ CREATE (a:V {n: 'a'})-[:E]->(b:V {n: 'b'}) $$) AS (v agtype);
+ANALYZE ggm2."V";
+ANALYZE ggm2."E";
+SET age.max_global_graph_memory = '1kB';
+SELECT * FROM cypher('ggm2', $$
+  MATCH (a:V {n: 'a'})-[:E*1..1]->(x) RETURN x.n
+$$) AS (n agtype);
+
+-- and the graph that was already cached is still usable
+SELECT * FROM cypher('ggm', $$
+  MATCH (a:V {n: 'a'})-[:E*1..2]->(x) RETURN x.n ORDER BY x.n
+$$) AS (n agtype);
+RESET age.max_global_graph_memory;
+\set VERBOSITY default
+
+SELECT * FROM drop_graph('ggm', true);
+SELECT * FROM drop_graph('ggm2', true);
+
+-----------------------------------------------------------------------------------------------------------------------------
+--
 -- End of tests
 --
 

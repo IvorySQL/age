@@ -716,5 +716,153 @@ NOTICE:  graph "vle_trigger_test" has been dropped
 
 -----------------------------------------------------------------------------------------------------------------------------
 --
+-- age.max_global_graph_memory
+--
+-- The global graph cache is a full in-memory copy of a graph's adjacency,
+-- built once per backend. Before this GUC existed nothing bounded it, so a
+-- large enough graph grew the backend until the OOM killer took it down.
+-- Exceeding the limit can only be an error: every traversal consumer needs
+-- the cache, so there is no uncached path to fall back to.
+--
+-- These tests assert the observable contract only. They deliberately do not
+-- check byte counts: the amount a graph occupies depends on the allocator
+-- and on where the element count falls relative to the hashtables'
+-- power-of-two sizing.
+--
+-----------------------------------------------------------------------------------------------------------------------------
+SELECT * FROM create_graph('ggm');
+NOTICE:  graph "ggm" has been created
+ create_graph 
+--------------
+ 
+(1 row)
+
+SELECT * FROM cypher('ggm', $$
+  CREATE (a:V {n: 'a'})-[:E]->(b:V {n: 'b'})-[:E]->(c:V {n: 'c'})
+$$) AS (v agtype);
+ v 
+---
+(0 rows)
+
+ANALYZE ggm."V";
+ANALYZE ggm."E";
+-- the default is unlimited, and is a superuser-only kB setting
+SELECT setting, unit, vartype, context
+FROM pg_settings WHERE name = 'age.max_global_graph_memory';
+ setting | unit | vartype |  context  
+---------+------+---------+-----------
+ -1      | kB   | integer | superuser
+(1 row)
+
+-- unlimited: the traversal works
+SELECT * FROM cypher('ggm', $$
+  MATCH (a:V {n: 'a'})-[:E*1..2]->(x) RETURN x.n ORDER BY x.n
+$$) AS (n agtype);
+  n  
+-----
+ "b"
+ "c"
+(2 rows)
+
+-- Start from an empty cache so that the limit applies to this graph alone,
+-- and report errors terse: the detail line carries sizes that depend on the
+-- allocator and on what else the backend has cached.
+SELECT ag_catalog.age_delete_global_graphs(NULL);
+ age_delete_global_graphs 
+--------------------------
+ t
+(1 row)
+
+\set VERBOSITY terse
+-- a limit no graph can satisfy: the load is refused, not the backend
+SET age.max_global_graph_memory = '1kB';
+SELECT * FROM cypher('ggm', $$
+  MATCH (a:V {n: 'a'})-[:E*1..2]->(x) RETURN x.n ORDER BY x.n
+$$) AS (n agtype);
+ERROR:  global graph cache for graph "ggm" would exceed age.max_global_graph_memory
+-- the error is reported as a configuration limit, so an application can
+-- recognize it by SQLSTATE rather than by message text
+DO $$
+BEGIN
+    PERFORM * FROM cypher('ggm', $q$
+      MATCH (a:V {n: 'a'})-[:E*1..2]->(x) RETURN x.n
+    $q$) AS (n agtype);
+    RAISE NOTICE 'no error raised';
+EXCEPTION WHEN configuration_limit_exceeded THEN
+    RAISE NOTICE 'configuration_limit_exceeded';
+END
+$$;
+NOTICE:  configuration_limit_exceeded
+-- a refused load leaves nothing cached: raising the limit in the same
+-- session must produce a complete graph, not a partially loaded one
+RESET age.max_global_graph_memory;
+SELECT * FROM cypher('ggm', $$
+  MATCH (a:V {n: 'a'})-[:E*1..2]->(x) RETURN x.n ORDER BY x.n
+$$) AS (n agtype);
+  n  
+-----
+ "b"
+ "c"
+(2 rows)
+
+-- the limit is a per-backend total across every cached graph, so a second
+-- graph is refused once the first has consumed the budget
+SELECT * FROM create_graph('ggm2');
+NOTICE:  graph "ggm2" has been created
+ create_graph 
+--------------
+ 
+(1 row)
+
+SELECT * FROM cypher('ggm2', $$ CREATE (a:V {n: 'a'})-[:E]->(b:V {n: 'b'}) $$) AS (v agtype);
+ v 
+---
+(0 rows)
+
+ANALYZE ggm2."V";
+ANALYZE ggm2."E";
+SET age.max_global_graph_memory = '1kB';
+SELECT * FROM cypher('ggm2', $$
+  MATCH (a:V {n: 'a'})-[:E*1..1]->(x) RETURN x.n
+$$) AS (n agtype);
+ERROR:  global graph cache for graph "ggm2" would exceed age.max_global_graph_memory
+-- and the graph that was already cached is still usable
+SELECT * FROM cypher('ggm', $$
+  MATCH (a:V {n: 'a'})-[:E*1..2]->(x) RETURN x.n ORDER BY x.n
+$$) AS (n agtype);
+  n  
+-----
+ "b"
+ "c"
+(2 rows)
+
+RESET age.max_global_graph_memory;
+\set VERBOSITY default
+SELECT * FROM drop_graph('ggm', true);
+NOTICE:  drop cascades to 4 other objects
+DETAIL:  drop cascades to table ggm._ag_label_vertex
+drop cascades to table ggm._ag_label_edge
+drop cascades to table ggm."V"
+drop cascades to table ggm."E"
+NOTICE:  graph "ggm" has been dropped
+ drop_graph 
+------------
+ 
+(1 row)
+
+SELECT * FROM drop_graph('ggm2', true);
+NOTICE:  drop cascades to 4 other objects
+DETAIL:  drop cascades to table ggm2._ag_label_vertex
+drop cascades to table ggm2._ag_label_edge
+drop cascades to table ggm2."V"
+drop cascades to table ggm2."E"
+NOTICE:  graph "ggm2" has been dropped
+ drop_graph 
+------------
+ 
+(1 row)
+
+-----------------------------------------------------------------------------------------------------------------------------
+--
 -- End of tests
 --
