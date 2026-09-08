@@ -174,6 +174,8 @@ typedef struct GRAPH_global_context
     MemoryContext vertex_mcxt;     /* child context owning the vertex side */
     MemoryContext edge_table_mcxt; /* child context owning edge_table */
     int64 memcheck_counter;        /* insertions since the last memory check */
+    int refcount;                  /* live users holding this pointer */
+    bool unlinked;                 /* off the list; free at the last unpin */
     uint64 graph_version;          /* version counter for cache invalidation */
     TransactionId xmin;            /* snapshot fallback: transaction xmin */
     TransactionId xmax;            /* snapshot fallback: transaction xmax */
@@ -247,6 +249,9 @@ static Size ggctx_memory_limit_bytes(void);
 static void ggctx_memory_limit_error(const char *graph_name, Size required,
                                      Size other_cached, Size limit);
 static void precheck_graph_memory_limit(Oid graph_oid, char *graph_name);
+static void release_GRAPH_global_context(GRAPH_global_context *ggctx);
+static bool evict_GRAPH_global_contexts(GRAPH_global_context *except,
+                                        Size needed, Size limit);
 static void enforce_ggctx_memory_limit(GRAPH_global_context *ggctx);
 static void check_ggctx_memory_limit(GRAPH_global_context *ggctx);
 static List *get_ag_labels_names(Snapshot snapshot, Oid graph_oid,
@@ -770,6 +775,152 @@ static bool insert_vertex_edge(GRAPH_global_context *ggctx,
 
 
 /*
+ * Refcounting for cached contexts.
+ *
+ * A context can be released for two reasons: it was invalidated by a write to
+ * the graph, or it was evicted to make room under
+ * age.max_global_graph_memory. Either way it may be in use: age_vle keeps
+ * vlelctx->ggctx and a raw GraphIdNode pointer into the vertices list for the
+ * duration of one SRF execution, and a single statement can traverse two
+ * graphs, so a load for the second graph can be reached while the first is
+ * suspended. Freeing under a running traversal would be a use-after-free, so
+ * a pinned context is unlinked from the list instead - no new caller can find
+ * it - and freed when its last user releases it.
+ *
+ * Only the window of one SRF execution needs a pin. A VLE_local_context
+ * cached across statements does not trust its stored ggctx: it looks the
+ * graph up again by oid and discards itself if that returns NULL or an
+ * invalidated context. age_shortest_path never retains a ggctx at all; it
+ * materializes its result paths during the first call.
+ */
+void pin_GRAPH_global_context(GRAPH_global_context *ggctx)
+{
+    if (ggctx != NULL)
+    {
+        ggctx->refcount++;
+    }
+}
+
+void unpin_GRAPH_global_context(GRAPH_global_context *ggctx)
+{
+    if (ggctx == NULL)
+    {
+        return;
+    }
+
+    Assert(ggctx->refcount > 0);
+
+    if (ggctx->refcount > 0)
+    {
+        ggctx->refcount--;
+    }
+
+    /* the last user of an already unlinked context frees it */
+    if (ggctx->refcount == 0 && ggctx->unlinked)
+    {
+        free_specific_GRAPH_global_context(ggctx);
+    }
+}
+
+/*
+ * Drop a context that has already been taken off global_graph_contexts,
+ * deferring the free while it is still in use.
+ */
+static void release_GRAPH_global_context(GRAPH_global_context *ggctx)
+{
+    if (ggctx == NULL)
+    {
+        return;
+    }
+
+    ggctx->next = NULL;
+
+    if (ggctx->refcount > 0)
+    {
+        ggctx->unlinked = true;
+        return;
+    }
+
+    free_specific_GRAPH_global_context(ggctx);
+}
+
+/*
+ * Release cached contexts to make room for a load of `needed` bytes, oldest
+ * first, skipping contexts that are in use and the one being built. Returns
+ * true when the load now fits.
+ *
+ * The cache is rebuildable by definition, so evicting is always preferable to
+ * failing a query: the cost is a later reload, not lost work. It is logged
+ * because a session alternating between graphs that do not both fit will
+ * evict on every statement, and the remedy for that - a higher limit - is
+ * only visible to an operator who can see it happening.
+ */
+static bool evict_GRAPH_global_contexts(GRAPH_global_context *except,
+                                        Size needed, Size limit)
+{
+    /*
+     * If the load does not fit even in an empty cache, evicting cannot help,
+     * and throwing away contexts that other queries would have reused makes
+     * the failure worse than it needs to be. Fail with the cache intact.
+     */
+    if (needed > limit)
+    {
+        return false;
+    }
+
+    for (;;)
+    {
+        GRAPH_global_context *victim = NULL;
+        GRAPH_global_context *prev_of_victim = NULL;
+        GRAPH_global_context *prev = NULL;
+        GRAPH_global_context *curr = NULL;
+        Size victim_bytes;
+
+        if (cached_graphs_memory_used(except) + needed <= limit)
+        {
+            return true;
+        }
+
+        /*
+         * Pick the last eligible context in the list. New contexts are added
+         * at the head, so this evicts the least recently built first.
+         */
+        for (curr = global_graph_contexts; curr != NULL; curr = curr->next)
+        {
+            if (curr != except && curr->refcount == 0)
+            {
+                victim = curr;
+                prev_of_victim = prev;
+            }
+
+            prev = curr;
+        }
+
+        if (victim == NULL)
+        {
+            return false;
+        }
+
+        victim_bytes = ggctx_memory_used(victim);
+
+        if (prev_of_victim == NULL)
+        {
+            global_graph_contexts = victim->next;
+        }
+        else
+        {
+            prev_of_victim->next = victim->next;
+        }
+
+        ereport(LOG,
+                (errmsg("released cached global graph \"%s\" (%zu kB) to stay within age.max_global_graph_memory",
+                        victim->graph_name, (victim_bytes + 1023) / 1024)));
+
+        release_GRAPH_global_context(victim);
+    }
+}
+
+/*
  * age.max_global_graph_memory support.
  *
  * Every cached GRAPH_global_context owns a private MemoryContext tree
@@ -932,10 +1083,22 @@ static void precheck_graph_memory_limit(Oid graph_oid, char *graph_name)
     MemoryContextDelete(tmpctx);
 
     required = (Size) (elements * GGCTX_PRECHECK_BYTES_PER_ELEMENT);
-    other_cached = cached_graphs_memory_used(NULL);
 
-    if (other_cached + required > limit)
+    /*
+     * Compare against the limit alone, not against the limit minus what is
+     * already cached, and do not evict here.
+     *
+     * The estimate is deliberately far below the real cost, so a load that
+     * looks like it fits in the remaining budget routinely does not. Evicting
+     * on the strength of it would throw away contexts other queries would
+     * have reused and then fail anyway. This check therefore answers only the
+     * question it can answer reliably - whether the graph could fit even in
+     * an empty cache - and leaves everything else to the in-load check, which
+     * measures real allocations and can evict on that basis.
+     */
+    if (required > limit)
     {
+        other_cached = cached_graphs_memory_used(NULL);
         ggctx_memory_limit_error(graph_name, required, other_cached, limit);
     }
 }
@@ -959,12 +1122,14 @@ static void enforce_ggctx_memory_limit(GRAPH_global_context *ggctx)
     }
 
     used = ggctx_memory_used(ggctx);
-    other_cached = cached_graphs_memory_used(ggctx);
 
-    if (other_cached + used > limit)
+    if (evict_GRAPH_global_contexts(ggctx, used, limit))
     {
-        ggctx_memory_limit_error(ggctx->graph_name, used, other_cached, limit);
+        return;
     }
+
+    other_cached = cached_graphs_memory_used(ggctx);
+    ggctx_memory_limit_error(ggctx->graph_name, used, other_cached, limit);
 }
 
 /*
@@ -1302,8 +1467,6 @@ GRAPH_global_context *manage_GRAPH_global_contexts(char *graph_name,
         /* if the transaction ids have changed, we have an invalid graph */
         if (is_ggctx_invalid(curr_ggctx))
         {
-            bool success = false;
-
             /*
              * If prev_ggctx is NULL then we are freeing the top of the
              * contexts. So, we need to point the contexts variable to the
@@ -1318,16 +1481,12 @@ GRAPH_global_context *manage_GRAPH_global_contexts(char *graph_name,
                 prev_ggctx->next = curr_ggctx->next;
             }
 
-            /* free the current graph context */
-            success = free_specific_GRAPH_global_context(curr_ggctx);
-
-            /* if it wasn't successfull, there was a missing vertex entry */
-            if (!success)
-            {
-
-                ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION),
-                                errmsg("missing vertex or edge entry during free")));
-            }
+            /*
+             * Drop the context. It is already off the list, so no new caller
+             * can find it; if a traversal is still walking it the free is
+             * deferred to that traversal's release.
+             */
+            release_GRAPH_global_context(curr_ggctx);
         }
         else
         {

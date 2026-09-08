@@ -411,10 +411,25 @@ SELECT * FROM cypher('ggm2', $$
   MATCH (a:V {n: 'a'})-[:E*1..1]->(x) RETURN x.n
 $$) AS (n agtype);
 
--- and the graph that was already cached is still usable
+-- a load that cannot fit even in an empty cache must not evict on its way
+-- out: the graph already cached is still there and still usable
 SELECT * FROM cypher('ggm', $$
   MATCH (a:V {n: 'a'})-[:E*1..2]->(x) RETURN x.n ORDER BY x.n
 $$) AS (n agtype);
+
+-- with a limit that one graph fits under but two do not, the second load
+-- evicts the first instead of failing, and both queries succeed
+SET age.max_global_graph_memory = '12MB';
+SELECT * FROM cypher('ggm2', $$
+  MATCH (a:V {n: 'a'})-[:E*1..1]->(x) RETURN x.n
+$$) AS (n agtype);
+SELECT * FROM cypher('ggm', $$
+  MATCH (a:V {n: 'a'})-[:E*1..2]->(x) RETURN x.n ORDER BY x.n
+$$) AS (n agtype);
+SELECT * FROM cypher('ggm2', $$
+  MATCH (a:V {n: 'a'})-[:E*1..1]->(x) RETURN x.n
+$$) AS (n agtype);
+
 RESET age.max_global_graph_memory;
 \set VERBOSITY default
 
