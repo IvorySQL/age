@@ -28,12 +28,27 @@ RETURNS NULL ON NULL INPUT
 PARALLEL SAFE
 AS 'MODULE_PATHNAME';
 
+--
+-- Statistics-aware restriction selectivity for @> and @>>. Decomposes a
+-- constant object into per-key equalities on agtype_access_operator() and
+-- consults the expression statistics users attach to that expression; falls
+-- back to the constant contsel returned when none exist. See
+-- agtype_selfuncs.c.
+--
+CREATE FUNCTION ag_catalog.agtype_contains_sel(internal, oid, internal, integer)
+    RETURNS float8
+    LANGUAGE c
+    STABLE
+    STRICT
+    PARALLEL SAFE
+AS 'MODULE_PATHNAME';
+
 CREATE OPERATOR @> (
   LEFTARG = agtype,
   RIGHTARG = agtype,
   FUNCTION = ag_catalog.agtype_contains,
   COMMUTATOR = '<@',
-  RESTRICT = contsel,
+  RESTRICT = ag_catalog.agtype_contains_sel,
   JOIN = contjoinsel
 );
 
@@ -67,7 +82,7 @@ CREATE OPERATOR @>> (
   RIGHTARG = agtype,
   FUNCTION = ag_catalog.agtype_contains_top_level,
   COMMUTATOR = '<<@',
-  RESTRICT = contsel,
+  RESTRICT = ag_catalog.agtype_contains_sel,
   JOIN = contjoinsel
 );
 

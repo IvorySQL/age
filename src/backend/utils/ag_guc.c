@@ -23,6 +23,7 @@
 #include "utils/ag_guc.h"
 
 bool age_enable_containment = true;
+bool age_enable_containment_statistics = true;
 
 /*
  * Defines AGE's custom configuration parameters.
@@ -38,6 +39,16 @@ void define_config_params(void)
                              &age_enable_containment,
                              true,
                              PGC_SUSET,
+                             0,
+                             NULL,
+                             NULL,
+                             NULL);
+    DefineCustomBoolVariable("age.enable_containment_statistics",
+                             "Consult expression statistics when estimating the selectivity of agtype containment (@>, @>>). When off, a fixed selectivity is used.",
+                             NULL,
+                             &age_enable_containment_statistics,
+                             true,
+                             PGC_USERSET,
                              0,
                              NULL,
                              NULL,

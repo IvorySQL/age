@@ -38,6 +38,7 @@
  * expression index.
  */
 extern bool age_enable_containment;
+extern bool age_enable_containment_statistics;
 
 void define_config_params(void);
 
