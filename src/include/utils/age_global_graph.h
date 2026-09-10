@@ -60,6 +60,14 @@ GRAPH_global_context *manage_GRAPH_global_contexts(char *graph_name,
                                                    Oid graph_oid);
 GRAPH_global_context *find_GRAPH_global_context(Oid graph_oid);
 bool is_ggctx_invalid(GRAPH_global_context *ggctx);
+/*
+ * Pin a context for as long as a caller holds the pointer, or a pointer into
+ * anything the context owns. A pinned context that is invalidated or evicted
+ * is unlinked so no new caller finds it, and freed when the last user
+ * releases it.
+ */
+void pin_GRAPH_global_context(GRAPH_global_context *ggctx);
+void unpin_GRAPH_global_context(GRAPH_global_context *ggctx);
 /* GRAPH retrieval functions */
 ListGraphId *get_graph_vertices(GRAPH_global_context *ggctx);
 vertex_entry *get_vertex_entry(GRAPH_global_context *ggctx,

@@ -30,6 +30,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 #include "utils/builtins.h"
 
 #if PG_VERSION_NUM >= 170000
@@ -39,6 +40,7 @@
 #include "storage/shmem.h"
 #endif
 
+#include "utils/ag_guc.h"
 #include "utils/age_global_graph.h"
 #include "utils/agehash.h"
 #include "catalog/ag_graph.h"
@@ -50,6 +52,34 @@
 #define VERTEX_HTAB_NAME "Vertex to edge lists " /* added a space at end for */
 #define VERTEX_HTAB_INITIAL_SIZE 10000
 #define EDGE_HTAB_INITIAL_SIZE 10000
+
+/*
+ * How many vertex or edge insertions to make between memory-limit checks
+ * during a load. MemoryContextMemAllocated walks the context's block list,
+ * so checking per tuple would be a measurable cost on a multi-million
+ * element graph; checking every few thousand bounds the overshoot to a few
+ * thousand entries' worth of memory, which is negligible against any useful
+ * setting of age.max_global_graph_memory.
+ */
+#define GGCTX_MEMCHECK_INTERVAL 8192
+
+/*
+ * Deliberately low bytes-per-element figure for the pre-load estimate only.
+ *
+ * Measured cost, as MemoryContextMemAllocated reports it, is 105 bytes per
+ * element on a 500k-vertex/1.5M-edge graph, 123 on 3M/9M and 159 on
+ * 500k/500k. The spread comes from the power-of-two sizing of the two
+ * hashtables and from the fixed cost of the first edge at each vertex, so it
+ * depends on a graph's shape rather than on anything predictable from the row
+ * counts alone.
+ *
+ * This constant sits below that whole range on purpose. The pre-load check
+ * exists only so that a load which cannot possibly fit fails in
+ * milliseconds instead of after a full scan, so it must never reject a graph
+ * that would have fit; under-estimating just means the in-load check, which
+ * is authoritative, does the rejecting instead.
+ */
+#define GGCTX_PRECHECK_BYTES_PER_ELEMENT 64
 
 /* Maximum number of graphs tracked for version counting */
 #define AGE_MAX_GRAPHS 128
@@ -140,7 +170,12 @@ typedef struct GRAPH_global_context
     Oid graph_oid;                 /* graph oid for searching */
     HTAB *vertex_hashtable;        /* hashtable to hold vertex edge lists */
     AgeHashTable *edge_table;      /* edge to vertex map (Robin Hood) */
-    MemoryContext edge_table_mcxt; /* private context owning edge_table */
+    MemoryContext ggctx_mcxt;      /* parent context owning this whole context */
+    MemoryContext vertex_mcxt;     /* child context owning the vertex side */
+    MemoryContext edge_table_mcxt; /* child context owning edge_table */
+    int64 memcheck_counter;        /* insertions since the last memory check */
+    int refcount;                  /* live users holding this pointer */
+    bool unlinked;                 /* off the list; free at the last unpin */
     uint64 graph_version;          /* version counter for cache invalidation */
     TransactionId xmin;            /* snapshot fallback: transaction xmin */
     TransactionId xmax;            /* snapshot fallback: transaction xmax */
@@ -208,6 +243,17 @@ static void load_GRAPH_global_hashtables(GRAPH_global_context *ggctx);
 static void load_vertex_hashtable(GRAPH_global_context *ggctx);
 static void load_edge_hashtable(GRAPH_global_context *ggctx);
 static void freeze_GRAPH_global_hashtables(GRAPH_global_context *ggctx);
+static Size ggctx_memory_used(GRAPH_global_context *ggctx);
+static Size cached_graphs_memory_used(GRAPH_global_context *except);
+static Size ggctx_memory_limit_bytes(void);
+static void ggctx_memory_limit_error(const char *graph_name, Size required,
+                                     Size other_cached, Size limit);
+static void precheck_graph_memory_limit(Oid graph_oid, char *graph_name);
+static void release_GRAPH_global_context(GRAPH_global_context *ggctx);
+static bool evict_GRAPH_global_contexts(GRAPH_global_context *except,
+                                        Size needed, Size limit);
+static void enforce_ggctx_memory_limit(GRAPH_global_context *ggctx);
+static void check_ggctx_memory_limit(GRAPH_global_context *ggctx);
 static List *get_ag_labels_names(Snapshot snapshot, Oid graph_oid,
                                  char label_type);
 static bool insert_edge_entry(GRAPH_global_context *ggctx, graphid edge_id,
@@ -340,27 +386,37 @@ static void create_GRAPH_global_hashtables(GRAPH_global_context *ggctx)
     strcpy(vhn, VERTEX_HTAB_NAME);
     vhn = strncat(vhn, graph_name, glen);
 
-    /* initialize the vertex hashtable */
+    /*
+     * Initialize the vertex hashtable inside vertex_mcxt.
+     *
+     * HASH_CONTEXT puts the HTAB header, its directory and all of its
+     * entries in that context; load_GRAPH_global_hashtables additionally
+     * runs the load with vertex_mcxt current, so the per-vertex
+     * VertexEdgeArray allocations and the vertices list land there too.
+     * The whole vertex side is then reclaimed by one MemoryContextDelete.
+     */
+    ggctx->vertex_mcxt = AllocSetContextCreate(ggctx->ggctx_mcxt,
+                                               "AGE vertex_hashtable",
+                                               ALLOCSET_DEFAULT_SIZES);
+
     MemSet(&vertex_ctl, 0, sizeof(vertex_ctl));
     vertex_ctl.keysize = sizeof(int64);
     vertex_ctl.entrysize = sizeof(vertex_entry);
     vertex_ctl.hash = graphid_hash;
+    vertex_ctl.hcxt = ggctx->vertex_mcxt;
     ggctx->vertex_hashtable = hash_create(vhn, VERTEX_HTAB_INITIAL_SIZE,
                                           &vertex_ctl,
-                                          HASH_ELEM | HASH_FUNCTION);
+                                          HASH_ELEM | HASH_FUNCTION |
+                                          HASH_CONTEXT);
     pfree_if_not_null(vhn);
 
     /*
-     * Initialize the edge_table (agehash, INLINE mode).
-     *
-     * Owns its own MemoryContext as a child of CurrentMemoryContext (which,
-     * at the call site, is TopMemoryContext for the lifetime of the cached
-     * GRAPH_global_context). Cleanup is a single MemoryContextDelete in
-     * free_specific_GRAPH_global_context, so an elog during build cannot
-     * leak slots.
+     * Initialize the edge_table (agehash, INLINE mode) inside its own child
+     * context. Cleanup for both sides is a single MemoryContextDelete of
+     * ggctx_mcxt in free_specific_GRAPH_global_context.
      */
     ggctx->edge_table_mcxt =
-        AllocSetContextCreate(CurrentMemoryContext,
+        AllocSetContextCreate(ggctx->ggctx_mcxt,
                               "AGE edge_table",
                               ALLOCSET_DEFAULT_SIZES);
     ggctx->edge_table = agehash_create_inline(ggctx->edge_table_mcxt,
@@ -559,6 +615,9 @@ static bool insert_edge_entry(GRAPH_global_context *ggctx, graphid edge_id,
     /* increment the number of loaded edges */
     ggctx->num_loaded_edges++;
 
+    /* fail the load rather than the backend if we are over the limit */
+    check_ggctx_memory_limit(ggctx);
+
     return true;
 }
 
@@ -622,6 +681,9 @@ static bool insert_vertex_entry(GRAPH_global_context *ggctx, graphid vertex_id,
 
     /* increment the number of loaded vertices */
     ggctx->num_loaded_vertices++;
+
+    /* fail the load rather than the backend if we are over the limit */
+    check_ggctx_memory_limit(ggctx);
 
     return true;
 }
@@ -709,6 +771,384 @@ static bool insert_vertex_edge(GRAPH_global_context *ggctx,
     }
 
     return false;
+}
+
+
+/*
+ * Refcounting for cached contexts.
+ *
+ * A context can be released for two reasons: it was invalidated by a write to
+ * the graph, or it was evicted to make room under
+ * age.max_global_graph_memory. Either way it may be in use: age_vle keeps
+ * vlelctx->ggctx and a raw GraphIdNode pointer into the vertices list for the
+ * duration of one SRF execution, and a single statement can traverse two
+ * graphs, so a load for the second graph can be reached while the first is
+ * suspended. Freeing under a running traversal would be a use-after-free, so
+ * a pinned context is unlinked from the list instead - no new caller can find
+ * it - and freed when its last user releases it.
+ *
+ * Only the window of one SRF execution needs a pin. A VLE_local_context
+ * cached across statements does not trust its stored ggctx: it looks the
+ * graph up again by oid and discards itself if that returns NULL or an
+ * invalidated context. age_shortest_path never retains a ggctx at all; it
+ * materializes its result paths during the first call.
+ */
+void pin_GRAPH_global_context(GRAPH_global_context *ggctx)
+{
+    if (ggctx != NULL)
+    {
+        ggctx->refcount++;
+    }
+}
+
+void unpin_GRAPH_global_context(GRAPH_global_context *ggctx)
+{
+    if (ggctx == NULL)
+    {
+        return;
+    }
+
+    Assert(ggctx->refcount > 0);
+
+    if (ggctx->refcount > 0)
+    {
+        ggctx->refcount--;
+    }
+
+    /* the last user of an already unlinked context frees it */
+    if (ggctx->refcount == 0 && ggctx->unlinked)
+    {
+        free_specific_GRAPH_global_context(ggctx);
+    }
+}
+
+/*
+ * Drop a context that has already been taken off global_graph_contexts,
+ * deferring the free while it is still in use.
+ */
+static void release_GRAPH_global_context(GRAPH_global_context *ggctx)
+{
+    if (ggctx == NULL)
+    {
+        return;
+    }
+
+    ggctx->next = NULL;
+
+    if (ggctx->refcount > 0)
+    {
+        ggctx->unlinked = true;
+        return;
+    }
+
+    free_specific_GRAPH_global_context(ggctx);
+}
+
+/*
+ * Release cached contexts to make room for a load of `needed` bytes, oldest
+ * first, skipping contexts that are in use and the one being built. Returns
+ * true when the load now fits.
+ *
+ * The cache is rebuildable by definition, so evicting is always preferable to
+ * failing a query: the cost is a later reload, not lost work. It is logged
+ * because a session alternating between graphs that do not both fit will
+ * evict on every statement, and the remedy for that - a higher limit - is
+ * only visible to an operator who can see it happening.
+ */
+static bool evict_GRAPH_global_contexts(GRAPH_global_context *except,
+                                        Size needed, Size limit)
+{
+    /*
+     * If the load does not fit even in an empty cache, evicting cannot help,
+     * and throwing away contexts that other queries would have reused makes
+     * the failure worse than it needs to be. Fail with the cache intact.
+     */
+    if (needed > limit)
+    {
+        return false;
+    }
+
+    for (;;)
+    {
+        GRAPH_global_context *victim = NULL;
+        GRAPH_global_context *prev_of_victim = NULL;
+        GRAPH_global_context *prev = NULL;
+        GRAPH_global_context *curr = NULL;
+        Size victim_bytes;
+
+        if (cached_graphs_memory_used(except) + needed <= limit)
+        {
+            return true;
+        }
+
+        /*
+         * Pick the last eligible context in the list. New contexts are added
+         * at the head, so this evicts the least recently built first.
+         */
+        for (curr = global_graph_contexts; curr != NULL; curr = curr->next)
+        {
+            if (curr != except && curr->refcount == 0)
+            {
+                victim = curr;
+                prev_of_victim = prev;
+            }
+
+            prev = curr;
+        }
+
+        if (victim == NULL)
+        {
+            return false;
+        }
+
+        victim_bytes = ggctx_memory_used(victim);
+
+        if (prev_of_victim == NULL)
+        {
+            global_graph_contexts = victim->next;
+        }
+        else
+        {
+            prev_of_victim->next = victim->next;
+        }
+
+        ereport(LOG,
+                (errmsg("released cached global graph \"%s\" (%zu kB) to stay within age.max_global_graph_memory",
+                        victim->graph_name, (victim_bytes + 1023) / 1024)));
+
+        release_GRAPH_global_context(victim);
+    }
+}
+
+/*
+ * age.max_global_graph_memory support.
+ *
+ * Every cached GRAPH_global_context owns a private MemoryContext tree
+ * (ggctx_mcxt, with vertex_mcxt and edge_table_mcxt as children), so the
+ * memory a context holds is exactly what the allocator already tracks for
+ * that tree and no separate byte counting is needed. The limit is a
+ * per-backend total across every cached graph, in the spirit of
+ * temp_file_limit.
+ *
+ * Note that exceeding the limit can only be an error: every traversal
+ * consumer requires the cache, so there is no uncached path to fall back to.
+ * Turning "the OOM killer takes down the backend" into "this query fails" is
+ * the whole point.
+ */
+
+/* bytes this context's tree currently holds */
+static Size ggctx_memory_used(GRAPH_global_context *ggctx)
+{
+    if (ggctx == NULL || ggctx->ggctx_mcxt == NULL)
+    {
+        return 0;
+    }
+
+    return MemoryContextMemAllocated(ggctx->ggctx_mcxt, true);
+}
+
+/* bytes every already-cached context holds, excluding the one being built */
+static Size cached_graphs_memory_used(GRAPH_global_context *except)
+{
+    GRAPH_global_context *curr = NULL;
+    Size total = 0;
+
+    for (curr = global_graph_contexts; curr != NULL; curr = curr->next)
+    {
+        if (curr == except)
+        {
+            continue;
+        }
+
+        total += ggctx_memory_used(curr);
+    }
+
+    return total;
+}
+
+/* the configured limit in bytes, or 0 when unlimited */
+static Size ggctx_memory_limit_bytes(void)
+{
+    if (age_max_global_graph_memory < 0)
+    {
+        return 0;
+    }
+
+    return (Size) age_max_global_graph_memory * 1024;
+}
+
+/*
+ * Raise the limit-exceeded error.
+ *
+ * What matters is the backend total, so the detail line breaks it into the
+ * three terms: what this load needs, what the backend's other cached graphs
+ * already hold, and the limit. That lets the reader tell an oversized graph
+ * from an accumulation of cached graphs, which have different remedies.
+ * Sizes are rounded up so that a small graph does not report 0 kB.
+ */
+static void ggctx_memory_limit_error(const char *graph_name, Size required,
+                                     Size other_cached, Size limit)
+{
+    ereport(ERROR,
+            (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+             errmsg("global graph cache for graph \"%s\" would exceed age.max_global_graph_memory",
+                    graph_name),
+             errdetail("This load needs about %zu kB, other graphs cached by this backend hold %zu kB, and the limit is %d kB.",
+                       (required + 1023) / 1024, (other_cached + 1023) / 1024,
+                       age_max_global_graph_memory),
+             errhint("Raise age.max_global_graph_memory, release cached graphs with age_delete_global_graphs(), or reduce the size of the graph traversed.")));
+}
+
+/*
+ * Estimate the cache size for a graph from pg_class.reltuples and fail before
+ * loading if even the conservative estimate does not fit. This is only to
+ * avoid spending a full load - tens of seconds and gigabytes on a large
+ * graph - before failing; it uses GGCTX_PRECHECK_BYTES_PER_ELEMENT, which is
+ * below the whole measured range, so it never rejects a graph that would have
+ * fit. Tables that have never been analyzed (reltuples < 0) contribute
+ * nothing and are left to the in-load check.
+ */
+static void precheck_graph_memory_limit(Oid graph_oid, char *graph_name)
+{
+    Snapshot snapshot;
+    List *label_names = NIL;
+    ListCell *lc;
+    Oid graph_namespace_oid;
+    MemoryContext tmpctx;
+    MemoryContext oldctx;
+    Size limit;
+    Size other_cached;
+    double elements = 0.0;
+    Size required;
+    int i;
+
+    limit = ggctx_memory_limit_bytes();
+
+    if (limit == 0)
+    {
+        return;
+    }
+
+    /*
+     * The caller runs in TopMemoryContext, so the label name lists built
+     * below need a context of their own to be reclaimed from.
+     */
+    tmpctx = AllocSetContextCreate(CurrentMemoryContext,
+                                   "AGE graph memory precheck",
+                                   ALLOCSET_SMALL_SIZES);
+    oldctx = MemoryContextSwitchTo(tmpctx);
+
+    graph_namespace_oid = get_namespace_oid(graph_name, false);
+    snapshot = GetActiveSnapshot();
+
+    for (i = 0; i < 2; i++)
+    {
+        label_names = get_ag_labels_names(snapshot, graph_oid,
+                                          (i == 0) ? LABEL_TYPE_VERTEX
+                                                   : LABEL_TYPE_EDGE);
+
+        foreach (lc, label_names)
+        {
+            Oid relid;
+            HeapTuple tuple;
+            Form_pg_class reltup;
+
+            relid = get_relname_relid((char *) lfirst(lc),
+                                      graph_namespace_oid);
+
+            if (!OidIsValid(relid))
+            {
+                continue;
+            }
+
+            tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+
+            if (!HeapTupleIsValid(tuple))
+            {
+                continue;
+            }
+
+            reltup = (Form_pg_class) GETSTRUCT(tuple);
+
+            if (reltup->reltuples > 0)
+            {
+                elements += reltup->reltuples;
+            }
+
+            ReleaseSysCache(tuple);
+        }
+    }
+
+    MemoryContextSwitchTo(oldctx);
+    MemoryContextDelete(tmpctx);
+
+    required = (Size) (elements * GGCTX_PRECHECK_BYTES_PER_ELEMENT);
+
+    /*
+     * Compare against the limit alone, not against the limit minus what is
+     * already cached, and do not evict here.
+     *
+     * The estimate is deliberately far below the real cost, so a load that
+     * looks like it fits in the remaining budget routinely does not. Evicting
+     * on the strength of it would throw away contexts other queries would
+     * have reused and then fail anyway. This check therefore answers only the
+     * question it can answer reliably - whether the graph could fit even in
+     * an empty cache - and leaves everything else to the in-load check, which
+     * measures real allocations and can evict on that basis.
+     */
+    if (required > limit)
+    {
+        other_cached = cached_graphs_memory_used(NULL);
+        ggctx_memory_limit_error(graph_name, required, other_cached, limit);
+    }
+}
+
+/*
+ * Called from the insert paths every GGCTX_MEMCHECK_INTERVAL entries. This is
+ * the authoritative check: it measures what the load has actually allocated
+ * rather than estimating it.
+ */
+static void enforce_ggctx_memory_limit(GRAPH_global_context *ggctx)
+{
+    Size limit;
+    Size used;
+    Size other_cached;
+
+    limit = ggctx_memory_limit_bytes();
+
+    if (limit == 0)
+    {
+        return;
+    }
+
+    used = ggctx_memory_used(ggctx);
+
+    if (evict_GRAPH_global_contexts(ggctx, used, limit))
+    {
+        return;
+    }
+
+    other_cached = cached_graphs_memory_used(ggctx);
+    ggctx_memory_limit_error(ggctx->graph_name, used, other_cached, limit);
+}
+
+/*
+ * Called from the insert paths. Enforces the limit every
+ * GGCTX_MEMCHECK_INTERVAL entries so that a large load is stopped partway
+ * instead of running to completion; load_GRAPH_global_hashtables enforces it
+ * once more at the end, which is what catches a graph small enough never to
+ * reach the interval.
+ */
+static void check_ggctx_memory_limit(GRAPH_global_context *ggctx)
+{
+    if (++ggctx->memcheck_counter < GGCTX_MEMCHECK_INTERVAL)
+    {
+        return;
+    }
+
+    ggctx->memcheck_counter = 0;
+
+    enforce_ggctx_memory_limit(ggctx);
 }
 
 /* helper routine to load all vertices into the GRAPH global vertex hashtable */
@@ -799,15 +1239,36 @@ static void load_vertex_hashtable(GRAPH_global_context *ggctx)
  */
 static void load_GRAPH_global_hashtables(GRAPH_global_context *ggctx)
 {
+    MemoryContext oldctx;
+
     /* initialize statistics */
     ggctx->num_loaded_vertices = 0;
     ggctx->num_loaded_edges = 0;
+    ggctx->memcheck_counter = 0;
+
+    /*
+     * Run the load with vertex_mcxt current so that the per-vertex
+     * VertexEdgeArray allocations made by vea_append and the vertices list
+     * built by append_graphid are owned by the vertex side's context rather
+     * than by TopMemoryContext. The edge_table allocates in its own context
+     * regardless of the current one.
+     */
+    oldctx = MemoryContextSwitchTo(ggctx->vertex_mcxt);
 
     /* insert all of our vertices */
     load_vertex_hashtable(ggctx);
 
     /* insert all of our edges */
     load_edge_hashtable(ggctx);
+
+    MemoryContextSwitchTo(oldctx);
+
+    /*
+     * Enforce the limit on the finished context. The periodic check during
+     * the load only fires every GGCTX_MEMCHECK_INTERVAL entries, so a graph
+     * with fewer elements than that would otherwise never be checked.
+     */
+    enforce_ggctx_memory_limit(ggctx);
 }
 
 /*
@@ -937,77 +1398,28 @@ static void freeze_GRAPH_global_hashtables(GRAPH_global_context *ggctx)
  */
 static bool free_specific_GRAPH_global_context(GRAPH_global_context *ggctx)
 {
-    GraphIdNode *curr_vertex = NULL;
-
     /* don't do anything if NULL */
     if (ggctx == NULL)
     {
         return true;
     }
 
-    /* free the graph name */
-    pfree_if_not_null(ggctx->graph_name);
-    ggctx->graph_name = NULL;
-
-    ggctx->graph_oid = InvalidOid;
-    ggctx->next = NULL;
-
-    /* free the vertex edge lists and properties, starting with the head */
-    curr_vertex = peek_stack_head(ggctx->vertices);
-    while (curr_vertex != NULL)
-    {
-        GraphIdNode *next_vertex = NULL;
-        vertex_entry *value = NULL;
-        bool found = false;
-        graphid vertex_id;
-
-        /* get the next vertex in the list, if any */
-        next_vertex = next_GraphIdNode(curr_vertex);
-
-        /* get the current vertex id */
-        vertex_id = get_graphid(curr_vertex);
-
-        /* retrieve the vertex entry */
-        value = (vertex_entry *)hash_search(ggctx->vertex_hashtable,
-                                            (void *)&vertex_id, HASH_FIND,
-                                            &found);
-        /* this is bad if it isn't found, but leave that to the caller */
-        if (found == false)
-        {
-            return false;
-        }
-
-        /* free the edge arrays associated with this vertex */
-        vea_free(&value->edges_in);
-        vea_free(&value->edges_out);
-        vea_free(&value->edges_self);
-
-        /* move to the next vertex */
-        curr_vertex = next_vertex;
-    }
-
-    /* free the vertices list */
-    free_ListGraphId(ggctx->vertices);
-    ggctx->vertices = NULL;
-
-    /* free the hashtables */
-    hash_destroy(ggctx->vertex_hashtable);
     /*
-     * The edge_table and all of its slots live entirely inside
-     * edge_table_mcxt, so a single MemoryContextDelete reclaims them.
+     * Everything this context owns - the GRAPH_global_context struct itself,
+     * the graph name, the vertex hashtable with its entries and per-vertex
+     * VertexEdgeArray allocations, the vertices list, and the edge_table with
+     * all of its slots - lives inside ggctx_mcxt or one of its children, so a
+     * single delete reclaims all of it. Nothing may be read from ggctx after
+     * this point.
+     *
+     * hash_destroy is deliberately not called: it would pfree entries that
+     * the context delete reclaims anyway, and its own context handling
+     * assumes it owns the HTAB's context.
      */
-    if (ggctx->edge_table_mcxt != NULL)
+    if (ggctx->ggctx_mcxt != NULL)
     {
-        MemoryContextDelete(ggctx->edge_table_mcxt);
+        MemoryContextDelete(ggctx->ggctx_mcxt);
     }
-
-    ggctx->vertex_hashtable = NULL;
-    ggctx->edge_table = NULL;
-    ggctx->edge_table_mcxt = NULL;
-
-    /* free the context */
-    pfree_if_not_null(ggctx);
-    ggctx = NULL;
 
     return true;
 }
@@ -1027,6 +1439,7 @@ GRAPH_global_context *manage_GRAPH_global_contexts(char *graph_name,
     GRAPH_global_context *new_ggctx = NULL;
     GRAPH_global_context *curr_ggctx = NULL;
     GRAPH_global_context *prev_ggctx = NULL;
+    MemoryContext ggctx_mcxt = NULL;
     MemoryContext oldctx = NULL;
 
     /* we need a higher context, or one that isn't destroyed by SRF exit */
@@ -1054,8 +1467,6 @@ GRAPH_global_context *manage_GRAPH_global_contexts(char *graph_name,
         /* if the transaction ids have changed, we have an invalid graph */
         if (is_ggctx_invalid(curr_ggctx))
         {
-            bool success = false;
-
             /*
              * If prev_ggctx is NULL then we are freeing the top of the
              * contexts. So, we need to point the contexts variable to the
@@ -1070,16 +1481,12 @@ GRAPH_global_context *manage_GRAPH_global_contexts(char *graph_name,
                 prev_ggctx->next = curr_ggctx->next;
             }
 
-            /* free the current graph context */
-            success = free_specific_GRAPH_global_context(curr_ggctx);
-
-            /* if it wasn't successfull, there was a missing vertex entry */
-            if (!success)
-            {
-
-                ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION),
-                                errmsg("missing vertex or edge entry during free")));
-            }
+            /*
+             * Drop the context. It is already off the list, so no new caller
+             * can find it; if a traversal is still walking it the free is
+             * deferred to that traversal's release.
+             */
+            release_GRAPH_global_context(curr_ggctx);
         }
         else
         {
@@ -1105,20 +1512,27 @@ GRAPH_global_context *manage_GRAPH_global_contexts(char *graph_name,
         curr_ggctx = curr_ggctx->next;
     }
 
-    /* otherwise, we need to create one and possibly attach it */
+    /*
+     * We need to build one. Fail early if pg_class already says the graph
+     * cannot fit, so that an impossible load does not first spend the time
+     * and memory of a full scan.
+     */
+    precheck_graph_memory_limit(graph_oid, graph_name);
+
+    /*
+     * The whole context - the struct, the graph name, both hashtables and
+     * every per-vertex allocation - lives in a private context tree so that
+     * its memory can be measured against age.max_global_graph_memory and
+     * released with one delete.
+     */
+    ggctx_mcxt = AllocSetContextCreate(TopMemoryContext,
+                                       "AGE global graph context",
+                                       ALLOCSET_DEFAULT_SIZES);
+
+    MemoryContextSwitchTo(ggctx_mcxt);
+
     new_ggctx = palloc0(sizeof(GRAPH_global_context));
-
-    if (global_graph_contexts != NULL)
-    {
-        new_ggctx->next = global_graph_contexts;
-    }
-    else
-    {
-        new_ggctx->next = NULL;
-    }
-
-    /* set the global context variable */
-    global_graph_contexts = new_ggctx;
+    new_ggctx->ggctx_mcxt = ggctx_mcxt;
 
     /* set the graph name and oid */
     new_ggctx->graph_name = pstrdup(graph_name);
@@ -1134,14 +1548,42 @@ GRAPH_global_context *manage_GRAPH_global_contexts(char *graph_name,
 
     /* initialize our vertices list */
     new_ggctx->vertices = NULL;
+    new_ggctx->next = NULL;
 
-    /* build the hashtables for this graph */
-    create_GRAPH_global_hashtables(new_ggctx);
-    load_GRAPH_global_hashtables(new_ggctx);
-    freeze_GRAPH_global_hashtables(new_ggctx);
+    /*
+     * Build the hashtables, then publish.
+     *
+     * The context is deliberately not linked into global_graph_contexts
+     * until the build has finished. A load can raise an error - a malformed
+     * label table, or age.max_global_graph_memory being exceeded - and a
+     * partially built context left on the list would be indistinguishable
+     * from a complete one on the next call, because a failed load makes no
+     * change to bump the graph's version counter, so is_ggctx_invalid()
+     * would accept it and queries would silently see a graph missing
+     * vertices or edges.
+     *
+     * Since an unpublished context is unreachable, the error path has to
+     * release it here, which is one delete of the private tree.
+     */
+    PG_TRY();
+    {
+        create_GRAPH_global_hashtables(new_ggctx);
+        load_GRAPH_global_hashtables(new_ggctx);
+        freeze_GRAPH_global_hashtables(new_ggctx);
+    }
+    PG_CATCH();
+    {
+        MemoryContextSwitchTo(oldctx);
+        MemoryContextDelete(ggctx_mcxt);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
 
+    /* the context is complete: publish it */
+    new_ggctx->next = global_graph_contexts;
+    global_graph_contexts = new_ggctx;
 
-    /* switch back to the previous memory context */
+    /* switch our context back */
     MemoryContextSwitchTo(oldctx);
 
     return new_ggctx;

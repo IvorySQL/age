@@ -196,6 +196,7 @@ static VLE_local_context *build_local_vle_context(FunctionCallInfo fcinfo,
                                                   FuncCallContext *funcctx);
 static void create_VLE_local_state_hashtable(VLE_local_context *vlelctx);
 static void free_VLE_local_context(VLE_local_context *vlelctx);
+static void vle_unpin_ggctx_callback(void *arg);
 /* VLE graph traversal functions */
 static edge_state_entry *get_edge_state_with_hash(VLE_local_context *vlelctx,
                                                   graphid edge_id,
@@ -1991,6 +1992,30 @@ Datum age_vle(PG_FUNCTION_ARGS)
          */
         funcctx->user_fctx = vlelctx;
 
+        /*
+         * Pin the GRAPH global context for the rest of this execution.
+         *
+         * vlelctx->ggctx, and the GraphIdNode pointer into that context's
+         * vertices list, are dereferenced on every subsequent call. Without a
+         * pin, a load for another graph reached while this SRF is suspended
+         * could evict or invalidate the context out from under the traversal.
+         * A VLE_local_context cached across statements does not need this: it
+         * re-resolves its ggctx by oid on reuse.
+         */
+        if (vlelctx->ggctx != NULL)
+        {
+            MemoryContextCallback *cb;
+
+            pin_GRAPH_global_context(vlelctx->ggctx);
+
+            cb = MemoryContextAlloc(funcctx->multi_call_memory_ctx,
+                                    sizeof(MemoryContextCallback));
+            cb->func = vle_unpin_ggctx_callback;
+            cb->arg = vlelctx->ggctx;
+            MemoryContextRegisterResetCallback(funcctx->multi_call_memory_ctx,
+                                               cb);
+        }
+
         /* if we are starting from zero [*0..x] flag it */
         if (vlelctx->lidx == 0)
         {
@@ -2138,6 +2163,19 @@ Datum age_vle(PG_FUNCTION_ARGS)
         /* signal that we are done */
         SRF_RETURN_DONE(funcctx);
     }
+}
+
+/*
+ * Release the pin taken on the GRAPH global context for the duration of one
+ * age_vle SRF execution.
+ *
+ * Registered as a reset callback on the SRF's multi_call_memory_ctx so that
+ * it runs on every exit path - normal completion, an error, a cancelled
+ * query - without the pin having to be matched by hand at each of them.
+ */
+static void vle_unpin_ggctx_callback(void *arg)
+{
+    unpin_GRAPH_global_context((GRAPH_global_context *) arg);
 }
 
 /*

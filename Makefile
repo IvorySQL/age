@@ -142,6 +142,7 @@ OBJS = src/backend/age.o \
        src/backend/utils/adt/agtype.o \
        src/backend/utils/adt/agtype_ext.o \
        src/backend/utils/adt/agtype_gin.o \
+       src/backend/utils/adt/agtype_selfuncs.o \
        src/backend/utils/adt/agtype_ops.o \
        src/backend/utils/adt/agtype_parser.o \
        src/backend/utils/adt/agtype_util.o \

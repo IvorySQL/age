@@ -38,6 +38,20 @@
  * expression index.
  */
 extern bool age_enable_containment;
+extern bool age_enable_containment_statistics;
+
+/*
+ * Upper bound, in kilobytes, on the memory a single backend may use for its
+ * cached global graph contexts (the whole-graph adjacency copies built by
+ * manage_GRAPH_global_contexts for VLE and shortest-path traversal).
+ *
+ * -1, the default, means unlimited, which is the historical behavior. Any
+ * other value is a per-backend total across every graph the backend has
+ * cached, in the spirit of temp_file_limit: a load that would exceed it
+ * fails with ERRCODE_CONFIGURATION_LIMIT_EXCEEDED instead of letting the
+ * backend grow until the OOM killer takes it down.
+ */
+extern int age_max_global_graph_memory;
 
 void define_config_params(void);
 

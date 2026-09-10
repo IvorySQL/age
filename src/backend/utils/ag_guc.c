@@ -19,10 +19,14 @@
 
 #include "postgres.h"
 
+#include <limits.h>
+
 #include "utils/guc.h"
 #include "utils/ag_guc.h"
 
 bool age_enable_containment = true;
+bool age_enable_containment_statistics = true;
+int age_max_global_graph_memory = -1;
 
 /*
  * Defines AGE's custom configuration parameters.
@@ -42,5 +46,26 @@ void define_config_params(void)
                              NULL,
                              NULL,
                              NULL);
+    DefineCustomBoolVariable("age.enable_containment_statistics",
+                             "Consult expression statistics when estimating the selectivity of agtype containment (@>, @>>). When off, a fixed selectivity is used.",
+                             NULL,
+                             &age_enable_containment_statistics,
+                             true,
+                             PGC_USERSET,
+                             0,
+                             NULL,
+                             NULL,
+                             NULL);
+    DefineCustomIntVariable("age.max_global_graph_memory",
+                            "Sets the maximum memory a backend may use for cached global graph contexts.",
+                            "The global graph cache holds a full in-memory copy of a graph's adjacency, built once per backend for variable-length-edge and shortest-path traversal. This is the total across every graph cached by the backend. A load that would exceed the limit fails instead of growing the backend without bound. -1 means unlimited.",
+                            &age_max_global_graph_memory,
+                            -1,
+                            -1, INT_MAX,
+                            PGC_SUSET,
+                            GUC_UNIT_KB,
+                            NULL,
+                            NULL,
+                            NULL);
     EmitWarningsOnPlaceholders("age");
 }
